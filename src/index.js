@@ -14,6 +14,7 @@ import {
   parseIndexableString
 } from 'pouchdb-collate';
 
+import { stringMd5 } from 'pouchdb-md5';
 import TaskQueue from './taskqueue';
 import createView from './createView';
 import evalFunc from './evalfunc';
@@ -371,15 +372,39 @@ function defaultsTo(value) {
   };
 }
 
+// a digest of the emitted key/values for one doc. The metaDoc stores it, so a
+// change that emits the same key/values (e.g. an edit to a field the map
+// function ignores) needs no reads or writes of the key/value docs.
+function emitsHash(indexableKeysToKeyValues) {
+  var keys = Object.keys(indexableKeysToKeyValues).sort();
+  var parts = new Array(keys.length);
+  for (var i = 0, len = keys.length; i < len; i++) {
+    var keyValue = indexableKeysToKeyValues[keys[i]];
+    parts[i] = 'value' in keyValue ?
+      keys[i] + '\u0000' + JSON.stringify(keyValue.value) : keys[i];
+  }
+  return stringMd5(parts.join('\n'));
+}
+
+function sameValue(doc, keyValue) {
+  if (!('value' in keyValue)) {
+    return !('value' in doc);
+  }
+  return 'value' in doc &&
+    JSON.stringify(doc.value) === JSON.stringify(keyValue.value);
+}
+
 // returns a promise for a list of docs to update, based on the input docId.
 // the order doesn't matter, because post-3.2.0, bulkDocs
 // is an atomic operation in all three adapters.
+// key/value docs that already hold the emitted value are not in the list.
 function getDocsToPersist(docId, view, docIdsToChangesAndEmits) {
   var metaDocId = '_local/doc_' + docId;
   var defaultMetaDoc = {_id: metaDocId, keys: []};
   var docData = docIdsToChangesAndEmits[docId];
   var indexableKeysToKeyValues = docData.indexableKeysToKeyValues;
   var changes = docData.changes;
+  var hash = emitsHash(indexableKeysToKeyValues);
 
   function getMetaDoc() {
     if (isGenOne(changes)) {
@@ -411,14 +436,18 @@ function getDocsToPersist(docId, view, docIdsToChangesAndEmits) {
       if (!doc) { // deleted
         continue;
       }
-      kvDocs.push(doc);
       oldKeysMap[doc._id] = true;
-      doc._deleted = !indexableKeysToKeyValues[doc._id];
-      if (!doc._deleted) {
-        var keyValue = indexableKeysToKeyValues[doc._id];
+      var keyValue = indexableKeysToKeyValues[doc._id];
+      if (!keyValue) {
+        doc._deleted = true;
+        kvDocs.push(doc);
+      } else if (!sameValue(doc, keyValue)) {
         if ('value' in keyValue) {
           doc.value = keyValue.value;
+        } else {
+          delete doc.value;
         }
+        kvDocs.push(doc);
       }
     }
 
@@ -437,12 +466,16 @@ function getDocsToPersist(docId, view, docIdsToChangesAndEmits) {
       }
     });
     metaDoc.keys = uniq(newKeys.concat(metaDoc.keys));
+    metaDoc.hash = hash;
     kvDocs.push(metaDoc);
 
     return kvDocs;
   }
 
   return getMetaDoc().then(function (metaDoc) {
+    if (metaDoc.hash === hash) {
+      return [];
+    }
     return getKeyValueDocs(metaDoc).then(function (kvDocsRes) {
       return processKvDocs(metaDoc, kvDocsRes);
     });
