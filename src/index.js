@@ -415,14 +415,15 @@ function getDocsToPersist(docId, view, docIdsToChangesAndEmits) {
     return view.db.get(metaDocId).catch(defaultsTo(defaultMetaDoc));
   }
 
+  // reads each key/value doc with get, not allDocs: some adapters count all
+  // docs of the view db on every allDocs call, which is slow for a large view.
   function getKeyValueDocs(metaDoc) {
-    if (!metaDoc.keys.length) {
-      // no keys, no need for a lookup
-      return Promise.resolve({rows: []});
-    }
-    return view.db.allDocs({
-      keys: metaDoc.keys,
-      include_docs: true
+    return Promise.all(metaDoc.keys.map(function (key) {
+      return view.db.get(key).then(function (doc) {
+        return {doc: doc};
+      }, defaultsTo({}));
+    })).then(function (rows) {
+      return {rows: rows};
     });
   }
 
@@ -711,6 +712,14 @@ function queryViewInQueue(view, opts) {
     // equivalent query
     opts.limit = 0;
     delete opts.keys;
+  }
+
+  // with _update_only, the caller only wants the view up to date, which
+  // updateView has already done. The view db is not read: some adapters
+  // count all of its docs on every allDocs call, which is slow for a large
+  // view.
+  if (opts._update_only) {
+    return Promise.resolve({offset: skip, rows: []});
   }
 
   function fetchFromView(viewOpts) {
